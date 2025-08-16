@@ -12,7 +12,7 @@ import os
 
 # --- 0. Setup ---
 # Create a directory to save the plots
-output_dir = 'unified_data_study_plots'
+output_dir = 'robust_unified_data_plots'
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 print(f"Plots will be saved to the '{output_dir}/' directory.")
@@ -44,7 +44,7 @@ def load_unified_data(filepath):
 all_strain_data = load_unified_data('Z_filtered_all.mat')
 
 if all_strain_data is not None:
-    # Assuming the 19 cycles are the same as before, ending with 100
+    # Assuming the 19 cycles are: 1-10, 20, 30, 40, 50, 60, 70, 80, 90, 100
     all_cycle_numbers = np.array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
     print(f"Unified dataset loaded. Shape: {all_strain_data.shape}")
     if all_strain_data.shape[2] != len(all_cycle_numbers):
@@ -54,7 +54,7 @@ else:
     exit()
 
 # --- 2. Data Preprocessing and Feature Engineering ---
-strain_threshold = 0.0025
+strain_threshold = 0.002
 all_strain_data[all_strain_data < strain_threshold] = np.nan
 print(f"Strain values below {strain_threshold} have been set to NaN.")
 
@@ -106,8 +106,10 @@ reshaped_features_ng = features_no_gradient.reshape(-1, num_total_cycles, 1)
 valid_features_ng = reshaped_features_ng[valid_indices_mask]
 
 # --- Normalization and Dataloaders for Both ---
+# The scaler is fit on the entire history of each point for consistency
 scalers_wg = [MinMaxScaler().fit(d) for d in valid_features_wg]
 scaled_features_wg = np.array([s.transform(d) for s, d in zip(scalers_wg, valid_features_wg)])
+# Train on the first 17 points (cycles 1-80) to predict the 18th (cycle 90)
 X_train_wg = torch.tensor(scaled_features_wg[:, :-2, :], dtype=torch.float32)
 y_train_wg = torch.tensor(scaled_features_wg[:, -2, 0], dtype=torch.float32).unsqueeze(1)
 dataloader_wg = DataLoader(TensorDataset(X_train_wg, y_train_wg), batch_size=1024, shuffle=True)
@@ -124,24 +126,41 @@ class StrainPredictor(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2, output_size=1):
         super(StrainPredictor, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.bn = nn.BatchNorm1d(hidden_size)
         self.linear = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
-        return self.linear(lstm_out[:, -1, :])
+        last_time_step_out = lstm_out[:, -1, :]
+        bn_out = self.bn(last_time_step_out)
+        out = self.linear(bn_out)
+        return out
 
 
 def train_model(dataloader, model, model_name):
+    NUM_EPOCHS = 100
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+
     print(f"\n--- Starting Training for {model_name} ---")
-    for epoch in range(100):
-        for inputs, targets in tqdm(dataloader, desc=f"Epoch {epoch + 1}/50", leave=False):
+    for epoch in range(NUM_EPOCHS):
+        epoch_loss = 0
+        model.train()
+        for inputs, targets in tqdm(dataloader, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", leave=False):
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+
+        avg_epoch_loss = epoch_loss / len(dataloader)
+        scheduler.step(avg_epoch_loss)
+
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch [{epoch + 1}/{NUM_EPOCHS}], Average Loss: {avg_epoch_loss:.6f}")
+
     print(f"--- Training finished for {model_name} ---")
     return model
 
@@ -149,14 +168,29 @@ def train_model(dataloader, model, model_name):
 model_with_inv_gradient = train_model(dataloader_wg, StrainPredictor(input_size=2), "Model with Inverse Gradient")
 model_control = train_model(dataloader_ng, StrainPredictor(input_size=1), "Control Model (No Extra Feature)")
 
+
 # --- 5. Prediction and Visualization ---
+def predict_future(model, initial_sequence, scaler, has_extra_feature):
+    model.eval()
+    predict_input = torch.tensor(initial_sequence, dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        prediction_scaled = model(predict_input).cpu().numpy()[0, 0]
+
+    if has_extra_feature:
+        prediction_real = scaler.inverse_transform([[prediction_scaled, 0]])[0, 0]
+    else:
+        prediction_real = scaler.inverse_transform([[prediction_scaled]])[0, 0]
+
+    return prediction_real
+
+
 # --- Identify points to analyze ---
 max_strain_value = np.nanmax(all_strain_data)
 max_indices = np.where(all_strain_data == max_strain_value)
 max_y, max_x = max_indices[0][0], max_indices[1][0]
 max_point_flat_index = max_y * width + max_x
 points_to_plot = [max_point_flat_index]
-neighborhood_size = 5
+neighborhood_size = 10
 y_min, y_max = max(0, max_y - neighborhood_size), min(height, max_y + neighborhood_size)
 x_min, x_max = max(0, max_x - neighborhood_size), min(width, max_x + neighborhood_size)
 neighbor_indices = [y * width + x for y in range(y_min, y_max) for x in range(x_min, x_max) if
@@ -173,21 +207,13 @@ for point_flat_index in points_to_plot:
     except IndexError:
         continue
 
-    # Prepare input sequence (Cycles 1-90) for prediction
-    predict_input_wg = torch.tensor(scaled_features_wg[point_valid_index, :-1, :], dtype=torch.float32).unsqueeze(0)
-    predict_input_ng = torch.tensor(scaled_features_ng[point_valid_index, :-1, :], dtype=torch.float32).unsqueeze(0)
+    # Get predictions for Cycle 100 using the full 1-90 history
+    pred_real_wg = predict_future(model_with_inv_gradient, scaled_features_wg[point_valid_index, :-1, :],
+                                  scalers_wg[point_valid_index], True)
+    pred_real_ng = predict_future(model_control, scaled_features_ng[point_valid_index, :-1, :],
+                                  scalers_ng[point_valid_index], False)
 
-    # Get predictions for Cycle 100
-    model_with_inv_gradient.eval()
-    model_control.eval()
-    with torch.no_grad():
-        pred_scaled_wg = model_with_inv_gradient(predict_input_wg).cpu().numpy()[0, 0]
-        pred_scaled_ng = model_control(predict_input_ng).cpu().numpy()[0, 0]
-
-    # Inverse transform to get real values
-    pred_real_wg = scalers_wg[point_valid_index].inverse_transform([[pred_scaled_wg, 0]])[0, 0]
-    pred_real_ng = scalers_ng[point_valid_index].inverse_transform([[pred_scaled_ng]])[0, 0]
-
+    # Get training history and actual cycle 100 value
     training_history = valid_features_wg[point_valid_index, :-1, 0]
     actual_cycle_100_strain = valid_features_wg[point_valid_index, -1, 0]
 
@@ -209,7 +235,7 @@ for point_flat_index in points_to_plot:
     ax.legend();
     ax.grid(True);
     plt.tight_layout()
-    save_path = os.path.join(output_dir, f'unified_data_plot_y{point_y}_x{point_x}.png')
+    save_path = os.path.join(output_dir, f'robust_unified_plot_y{point_y}_x{point_x}.png')
     plt.savefig(save_path, dpi=300);
     plt.close(fig)
     print(f"Saved validation plot to: {save_path}")
@@ -223,15 +249,12 @@ for i in tqdm(range(len(valid_features_wg)), desc="Predicting all points for hea
     point_flat_index = valid_indices_array[i]
     point_y, point_x = np.unravel_index(point_flat_index, (height, width))
 
-    predict_input_wg = torch.tensor(scaled_features_wg[i, :-1, :], dtype=torch.float32).unsqueeze(0)
-    predict_input_ng = torch.tensor(scaled_features_ng[i, :-1, :], dtype=torch.float32).unsqueeze(0)
+    point_valid_index = i  # Re-assign for correct scaler lookup
+    pred_wg = predict_future(model_with_inv_gradient, scaled_features_wg[i, :-1, :], scalers_wg[i], True)
+    pred_ng = predict_future(model_control, scaled_features_ng[i, :-1, :], scalers_ng[i], False)
 
-    with torch.no_grad():
-        pred_scaled_wg = model_with_inv_gradient(predict_input_wg).cpu().numpy()[0, 0]
-        pred_scaled_ng = model_control(predict_input_ng).cpu().numpy()[0, 0]
-
-    heatmap_wg[point_y, point_x] = scalers_wg[i].inverse_transform([[pred_scaled_wg, 0]])[0, 0]
-    heatmap_ng[point_y, point_x] = scalers_ng[i].inverse_transform([[pred_scaled_ng]])[0, 0]
+    heatmap_wg[point_y, point_x] = pred_wg
+    heatmap_ng[point_y, point_x] = pred_ng
 
 actual_cycle_100_heatmap = all_strain_data[:, :, -1]
 error_map_wg = np.abs(heatmap_wg - actual_cycle_100_heatmap)
@@ -263,9 +286,9 @@ for ax_row in axes:
     for ax in ax_row: ax.axes.get_xaxis().set_visible(False); ax.axes.get_yaxis().set_visible(False)
 
 plt.tight_layout(rect=[0, 0, 1, 0.95])
-heatmap_save_path = os.path.join(output_dir, 'unified_data_heatmap_comparison.png')
+heatmap_save_path = os.path.join(output_dir, 'robust_unified_heatmap_comparison.png')
 plt.savefig(heatmap_save_path, dpi=300)
-print(f"Saved ablation study heatmap to: {heatmap_save_path}")
+print(f"Saved internal validation heatmap to: {heatmap_save_path}")
 plt.show()
 
 print("\nAll tasks completed successfully.")
